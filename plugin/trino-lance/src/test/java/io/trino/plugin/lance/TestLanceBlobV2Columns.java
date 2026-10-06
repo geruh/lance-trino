@@ -52,20 +52,33 @@ public class TestLanceBlobV2Columns
         extends AbstractTestQueryFramework
 {
     private static final String TABLE = "blob_v2_table";
+    private static final String DELETE_TABLE = "blob_v2_delete";
+    private static final String MERGE_DELETE_TABLE = "blob_v2_merge_delete";
+    private static final String REPLACE_TABLE = "blob_v2_replace";
+    private static final String EMPTY_TABLE = "blob_v2_empty";
+    private static final String DESCRIPTOR_TYPE = "ROW(kind smallint, position bigint, size bigint, blob_id bigint, blob_uri varchar)";
+    private static final String[] INLINE_VALUES = {"HELLO", "WORLD!", null};
+
+    private Path root;
 
     @Override
     protected QueryRunner createQueryRunner()
             throws Exception
     {
-        Path root = Files.createTempDirectory("lance-blob-v2-test");
+        root = Files.createTempDirectory("lance-blob-v2-test");
         closeAfterClass(() -> deleteRecursively(root, ALLOW_INSECURE));
-        writeBlobV2Dataset(root.resolve(TABLE + ".lance").toString());
+        writeBlobV2Dataset(root.resolve(TABLE + ".lance").toString(), INLINE_VALUES);
+        writeBlobV2Dataset(root.resolve(DELETE_TABLE + ".lance").toString(), INLINE_VALUES);
+        writeBlobV2Dataset(root.resolve(MERGE_DELETE_TABLE + ".lance").toString(), INLINE_VALUES);
+        writeBlobV2Dataset(root.resolve(REPLACE_TABLE + ".lance").toString(), INLINE_VALUES);
+        writeBlobV2Dataset(root.resolve(EMPTY_TABLE + ".lance").toString(), new String[] {"", null});
         return LanceQueryRunner.builder()
                 .addConnectorProperty("lance.root", root.toUri().toString())
+                .addConnectorProperty("lance.single_level_ns", "true")
                 .build();
     }
 
-    private static void writeBlobV2Dataset(String datasetPath)
+    private static void writeBlobV2Dataset(String datasetPath, String[] values)
     {
         Field blob = new Field(
                 "img",
@@ -86,7 +99,6 @@ public class TestLanceBlobV2Columns
                 LargeVarBinaryVector data = (LargeVarBinaryVector) img.getChild("data");
                 VarCharVector uri = (VarCharVector) img.getChild("uri");
 
-                String[] values = {"HELLO", "WORLD!", null};
                 for (int i = 0; i < values.length; i++) {
                     id.setSafe(i, i);
                     if (values[i] == null) {
@@ -165,5 +177,193 @@ public class TestLanceBlobV2Columns
                 "UPDATE " + TABLE + " SET id = 10 WHERE id = 0",
                 ".*Writing to Lance blob v2 column 'img' is not supported.*");
         assertQuery("SELECT id FROM " + TABLE, "VALUES 0, 1, 2");
+    }
+
+    @Test
+    public void testJoinCarriesBlobV2Descriptor()
+    {
+        assertQuery(
+                "SELECT t.id, t.img.kind, t.img.size, t.img.blob_uri FROM " + TABLE + " t "
+                        + "JOIN " + TABLE + " u ON t.id = u.id ORDER BY t.id",
+                "VALUES (0, 0, 5, ''), (1, 0, 6, ''), (2, NULL, NULL, NULL)");
+        assertQuery(
+                "SELECT count(*) FROM " + TABLE + " t JOIN " + TABLE + " u ON t.img = u.img",
+                "VALUES 2");
+    }
+
+    @Test
+    public void testEmptyBlobDescriptorIsNotNull()
+    {
+        assertQuery(
+                "SELECT id, img.kind, img.size, img IS NULL FROM " + EMPTY_TABLE + " ORDER BY id",
+                "VALUES (0, 0, 0, false), (1, NULL, NULL, true)");
+    }
+
+    @Test
+    public void testShowCreateTableShowsDescriptor()
+    {
+        String ddl = (String) computeScalar("SHOW CREATE TABLE " + TABLE);
+        assertThat(ddl).contains(DESCRIPTOR_TYPE);
+    }
+
+    @Test
+    public void testInsertSelectAndColumnListRejected()
+    {
+        assertQueryFails(
+                "INSERT INTO " + TABLE + " SELECT id + 10, img FROM " + TABLE,
+                ".*Writing to Lance blob v2 column 'img' is not supported.*");
+        assertQueryFails(
+                "INSERT INTO " + TABLE + " (id) VALUES (9)",
+                ".*Writing to Lance blob v2 column 'img' is not supported.*");
+        assertQuery("SELECT count(*) FROM " + TABLE, "VALUES 3");
+    }
+
+    @Test
+    public void testDeleteRemovesRowAndKeepsDescriptor()
+    {
+        assertUpdate("DELETE FROM " + DELETE_TABLE + " WHERE id = 0", 1);
+        assertUpdate("DELETE FROM " + DELETE_TABLE + " WHERE img IS NULL", 1);
+        assertQuery(
+                "SELECT id, img.kind, img.size FROM " + DELETE_TABLE,
+                "VALUES (1, 0, 6)");
+        assertQuery("SELECT count(*) FROM " + TABLE, "VALUES 3");
+    }
+
+    @Test
+    public void testMergeDeleteKeepsOtherDescriptors()
+    {
+        assertUpdate(
+                "MERGE INTO " + MERGE_DELETE_TABLE + " t USING (SELECT 0 AS id) s ON t.id = s.id WHEN MATCHED THEN DELETE",
+                1);
+        assertQuery(
+                "SELECT id, img.size FROM " + MERGE_DELETE_TABLE + " ORDER BY id",
+                "VALUES (1, 6), (2, NULL)");
+    }
+
+    @Test
+    public void testMergeUpdateAndInsertRejected()
+    {
+        assertQueryFails(
+                "MERGE INTO " + TABLE + " t USING (SELECT 0 AS id) s ON t.id = s.id "
+                        + "WHEN MATCHED THEN UPDATE SET id = 10",
+                ".*Writing to Lance blob v2 column 'img' is not supported.*");
+        assertQueryFails(
+                "MERGE INTO " + TABLE + " t USING (SELECT 3 AS id) s ON t.id = s.id "
+                        + "WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id)",
+                ".*Writing to Lance blob v2 column 'img' is not supported.*");
+        assertQuery("SELECT id FROM " + TABLE, "VALUES 0, 1, 2");
+    }
+
+    @Test
+    public void testCreateTableAsSelectOfDescriptorRejected()
+            throws Exception
+    {
+        String copy = "blob_v2_ctas";
+        try {
+            assertQueryFails(
+                    "CREATE TABLE " + copy + " AS SELECT * FROM " + TABLE,
+                    ".*ROW type write is not yet implemented.*");
+            assertQuery("SELECT id, img.size FROM " + TABLE + " WHERE id = 1", "VALUES (1, 6)");
+        }
+        finally {
+            removeTableDirectory(copy);
+            assertUpdate("DROP TABLE IF EXISTS " + copy);
+        }
+    }
+
+    @Test
+    public void testCreateTableAsSelectOfDescriptorFields()
+    {
+        String projected = "blob_v2_ctas_projected";
+        try {
+            assertUpdate(
+                    "CREATE TABLE " + projected + " AS SELECT id, img.kind AS kind, img.size AS size FROM " + TABLE,
+                    3);
+            assertQuery("SELECT id, kind, size FROM " + projected + " WHERE id = 1", "VALUES (1, 0, 6)");
+            assertUpdate("INSERT INTO " + projected + " VALUES (3, 1, 9)", 1);
+            assertUpdate("UPDATE " + projected + " SET size = 7 WHERE id = 1", 1);
+            assertUpdate("DELETE FROM " + projected + " WHERE id = 0", 1);
+            assertQuery(
+                    "SELECT id, kind, size FROM " + projected + " ORDER BY id",
+                    "VALUES (1, 0, 7), (2, NULL, NULL), (3, 1, 9)");
+            assertUpdate("CREATE OR REPLACE TABLE " + projected + " AS SELECT id, img.kind AS kind, img.size AS size FROM " + TABLE + " WHERE id = 1", 1);
+            assertQuery("SELECT id, kind, size FROM " + projected, "VALUES (1, 0, 6)");
+            assertQuery("SELECT id, img.size FROM " + TABLE + " WHERE id = 1", "VALUES (1, 6)");
+            assertUpdate("DROP TABLE " + projected);
+            assertQueryFails("SELECT count(*) FROM " + projected, ".*does not exist.*");
+        }
+        finally {
+            assertUpdate("DROP TABLE IF EXISTS " + projected);
+        }
+    }
+
+    @Test
+    public void testCreateOrReplaceOfBlobV2TableRejected()
+    {
+        assertQueryFails(
+                "CREATE OR REPLACE TABLE " + REPLACE_TABLE + " AS SELECT * FROM " + REPLACE_TABLE,
+                ".*Replacing Lance table '.*' is not supported because column 'img' is blob v2.*");
+        assertQuery(
+                "SELECT id, img.kind, img.size FROM " + REPLACE_TABLE + " ORDER BY id",
+                "VALUES (0, 0, 5), (1, 0, 6), (2, NULL, NULL)");
+    }
+
+    @Test
+    public void testCreatePlainDescriptorTableRejectsRowInsert()
+    {
+        String tableName = "blob_v2_plain_row";
+        try {
+            assertUpdate("CREATE TABLE " + tableName + " (id BIGINT, img ROW(kind SMALLINT, position BIGINT, size BIGINT, blob_id BIGINT, blob_uri VARCHAR))");
+            assertThat((String) computeScalar("SHOW CREATE TABLE " + tableName)).contains(DESCRIPTOR_TYPE);
+            assertQuery("SELECT count(*) FROM " + tableName, "VALUES 0");
+            assertQueryFails(
+                    "INSERT INTO " + tableName + " VALUES (1, ROW(0, 4, 5, 6, 'local'))",
+                    ".*ROW type write is not yet implemented.*");
+            assertQuery("SELECT count(*) FROM " + tableName, "VALUES 0");
+            assertUpdate("DROP TABLE " + tableName);
+            assertQueryFails("SELECT count(*) FROM " + tableName, ".*does not exist.*");
+        }
+        finally {
+            assertUpdate("DROP TABLE IF EXISTS " + tableName);
+        }
+    }
+
+    @Test
+    public void testCreateSchemaRejectedInSingleLevelNamespace()
+    {
+        assertQueryFails("CREATE SCHEMA blob_v2_schema", ".*does not support creating schemas.*");
+    }
+
+    @Test
+    public void testBlobPropertyRejectsDescriptorRow()
+    {
+        assertQueryFails(
+                "CREATE TABLE blob_v2_bad_prop (id BIGINT, img ROW(kind SMALLINT, position BIGINT, size BIGINT, blob_id BIGINT, blob_uri VARCHAR)) "
+                        + "WITH (blob_columns = 'img')",
+                ".*Blob column 'img' must have VARBINARY type.*");
+    }
+
+    @Test
+    public void testUnsupportedDdlDoesNotChangeBlobTable()
+    {
+        assertQueryFails("TRUNCATE TABLE " + TABLE, ".*(?i)(not support|unsupported).*");
+        assertQueryFails("ALTER TABLE " + TABLE + " RENAME TO blob_v2_renamed", ".*(?i)(not support|unsupported).*");
+        assertQueryFails("ALTER TABLE " + TABLE + " RENAME COLUMN id TO id2", ".*(?i)(not support|unsupported).*");
+        assertQueryFails("ALTER TABLE " + TABLE + " ADD COLUMN extra BIGINT", ".*(?i)(not support|unsupported).*");
+        assertQueryFails("ALTER TABLE " + TABLE + " DROP COLUMN id", ".*(?i)(not support|unsupported).*");
+        assertQueryFails("ALTER TABLE " + TABLE + " ALTER COLUMN id SET DATA TYPE VARCHAR", ".*(?i)(not support|unsupported).*");
+        assertQueryFails("COMMENT ON TABLE " + TABLE + " IS 'blob'", ".*(?i)(not support|unsupported).*");
+        assertQueryFails("COMMENT ON COLUMN " + TABLE + ".id IS 'id'", ".*(?i)(not support|unsupported).*");
+        assertQueryFails("CREATE VIEW blob_v2_view AS SELECT * FROM " + TABLE, ".*(?i)(not support|unsupported).*");
+        assertQuery("SELECT id, img.size FROM " + TABLE + " WHERE id = 1", "VALUES (1, 6)");
+    }
+
+    private void removeTableDirectory(String tableName)
+            throws Exception
+    {
+        Path path = root.resolve(tableName + ".lance");
+        if (Files.exists(path)) {
+            deleteRecursively(path, ALLOW_INSECURE);
+        }
     }
 }

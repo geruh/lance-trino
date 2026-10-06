@@ -16,6 +16,7 @@ package io.trino.plugin.lance;
 import io.trino.spi.type.RowType;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.util.List;
 import java.util.Map;
@@ -83,6 +84,16 @@ public final class BlobUtils
     public static boolean isBlobV2Metadata(Map<String, String> metadata)
     {
         return metadata != null && LANCE_BLOB_V2_EXTENSION_NAME.equals(metadata.get(ARROW_EXTENSION_NAME_KEY));
+    }
+
+    public static Optional<String> blobV2Column(Schema schema)
+    {
+        for (Field field : schema.getFields()) {
+            if (isBlobV2Field(field)) {
+                return Optional.of(field.getName());
+            }
+        }
+        return Optional.empty();
     }
 
     public static boolean isBlobStructField(Field field)

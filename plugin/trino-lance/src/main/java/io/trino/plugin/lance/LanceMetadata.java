@@ -918,6 +918,7 @@ public class LanceMetadata
             Schema arrowSchema = LancePageToArrowConverter.toArrowSchema(tableMetadata.getColumns(), blobColumns, vectorColumns);
             String userIdentity = session.getUser();
             try (Dataset dataset = runtime.openDatasetDirect(userIdentity, existingPath, null, storageOptions)) {
+                rejectBlobV2Replace(dataset.getSchema(), tableName);
                 commitOverwrite(dataset, List.of(), arrowSchema, storageOptions);
             }
             runtime.invalidate(userIdentity, existingPath);
@@ -1011,6 +1012,13 @@ public class LanceMetadata
                     .setStorageOptions(storageOptions)
                     .build();
             Dataset dataset = Dataset.open(tablePath, readOptions);
+            try {
+                rejectBlobV2Replace(dataset.getSchema(), tableName);
+            }
+            catch (RuntimeException e) {
+                dataset.close();
+                throw e;
+            }
             transactionDatasets.put(transactionId, dataset);
             // For replace tables (RTAS/CORTAS), use existing table's format if not specified
             if (fileFormatVersion == null) {
@@ -1476,6 +1484,16 @@ public class LanceMetadata
     }
 
     // ===== Write Operations (formerly in LanceWriter) =====
+
+    private static void rejectBlobV2Replace(Schema schema, SchemaTableName tableName)
+    {
+        Optional<String> column = BlobUtils.blobV2Column(schema);
+        if (column.isPresent()) {
+            throw new TrinoException(
+                    NOT_SUPPORTED,
+                    "Replacing Lance table '" + tableName + "' is not supported because column '" + column.get() + "' is blob v2");
+        }
+    }
 
     private void createEmptyDataset(String datasetUri, Schema schema, Map<String, String> storageOptions)
     {

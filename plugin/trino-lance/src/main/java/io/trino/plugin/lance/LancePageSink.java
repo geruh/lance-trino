@@ -33,10 +33,13 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static io.airlift.slice.Slices.wrappedBuffer;
+import static io.trino.spi.StandardErrorCode.NOT_SUPPORTED;
+import static java.lang.String.format;
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.CompletableFuture.completedFuture;
 
@@ -148,6 +151,12 @@ public class LancePageSink
     private List<String> writeFragments()
     {
         log.debug("Writing %d pages (%d rows) to dataset: %s", bufferedPages.size(), rowCount, datasetUri);
+
+        // A column list that omits the blob still writes the stored schema.
+        Optional<String> blobColumn = BlobUtils.blobV2Column(arrowSchema);
+        if (blobColumn.isPresent()) {
+            throw new TrinoException(NOT_SUPPORTED, format("Writing to Lance blob v2 column '%s' is not supported", blobColumn.get()));
+        }
 
         // Create a combined VectorSchemaRoot from all pages
         try (VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator)) {
