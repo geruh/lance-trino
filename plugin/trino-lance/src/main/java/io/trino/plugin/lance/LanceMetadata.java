@@ -63,6 +63,7 @@ import io.trino.spi.type.RowType;
 import io.trino.spi.type.TimestampType;
 import io.trino.spi.type.TimestampWithTimeZoneType;
 import io.trino.spi.type.Type;
+import io.trino.spi.type.VarcharType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.lance.CommitBuilder;
 import org.lance.Dataset;
@@ -238,17 +239,56 @@ public class LanceMetadata
         String userIdentity = session.getUser();
 
         Long datasetVersion;
+        String refName = null;
+        String branchName = null;
+        String readUri = null;
         if (endVersion.isPresent()) {
-            datasetVersion = resolveVersion(session, tablePath, storageOptions, endVersion.get());
+            LanceRuntime.ResolvedLanceRef resolved = resolveVersion(session, tablePath, storageOptions, endVersion.get());
+            datasetVersion = resolved.version();
+            refName = resolved.refName();
+            branchName = resolved.branchName();
+            readUri = resolved.readUri();
         }
         else {
             datasetVersion = runtime.getLatestVersion(userIdentity, tablePath, storageOptions);
         }
 
-        return new LanceTableHandle(name.getSchemaName(), name.getTableName(), tablePath, tableId, storageOptions, datasetVersion);
+        return new LanceTableHandle(name.getSchemaName(), name.getTableName(), tablePath, tableId, storageOptions, datasetVersion, refName, branchName, readUri);
     }
 
-    private Long resolveVersion(ConnectorSession session, String tablePath,
+    @Override
+    public Optional<SystemTable> getSystemTable(ConnectorSession session, SchemaTableName tableName)
+    {
+        Optional<String> baseName = baseTableForRefs(tableName.getTableName());
+        if (baseName.isEmpty()) {
+            return Optional.empty();
+        }
+
+        Optional<ResolvedTable> resolved = resolveTable(new SchemaTableName(tableName.getSchemaName(), baseName.get()));
+        if (resolved.isEmpty()) {
+            return Optional.empty();
+        }
+
+        ResolvedTable table = resolved.get();
+        LanceRefsTable refs = new LanceRefsTable(
+                runtime,
+                tableName,
+                table.description().getLocation(),
+                storageOptionsFrom(table.description()));
+        return Optional.of(new ClassLoaderSafeSystemTable(refs, getClass().getClassLoader()));
+    }
+
+    private static Optional<String> baseTableForRefs(String tableName)
+    {
+        String suffix = "$refs";
+        if (tableName.length() <= suffix.length() ||
+                !tableName.regionMatches(true, tableName.length() - suffix.length(), suffix, 0, suffix.length())) {
+            return Optional.empty();
+        }
+        return Optional.of(tableName.substring(0, tableName.length() - suffix.length()));
+    }
+
+    private LanceRuntime.ResolvedLanceRef resolveVersion(ConnectorSession session, String tablePath,
             Map<String, String> storageOptions, ConnectorTableVersion version)
     {
         String userIdentity = session.getUser();
@@ -256,13 +296,22 @@ public class LanceMetadata
 
         return switch (version.getPointerType()) {
             case TARGET_ID -> resolveTargetIdVersion(tablePath, storageOptions, userIdentity, version, versionType);
-            case TEMPORAL -> resolveTemporalVersion(session, tablePath, storageOptions, userIdentity, version, versionType);
+            case TEMPORAL -> new LanceRuntime.ResolvedLanceRef(
+                    null,
+                    resolveTemporalVersion(session, tablePath, storageOptions, userIdentity, version, versionType),
+                    null,
+                    null);
         };
     }
 
-    private Long resolveTargetIdVersion(String tablePath, Map<String, String> storageOptions,
+    private LanceRuntime.ResolvedLanceRef resolveTargetIdVersion(String tablePath, Map<String, String> storageOptions,
             String userIdentity, ConnectorTableVersion version, Type versionType)
     {
+        if (versionType instanceof VarcharType) {
+            return runtime.resolveNamedRef(
+                    userIdentity, tablePath, storageOptions, refName(version.getVersion()));
+        }
+
         long versionNumber;
         if (versionType.equals(BIGINT)) {
             versionNumber = (long) version.getVersion();
@@ -278,7 +327,7 @@ public class LanceMetadata
         }
         else {
             throw new TrinoException(NOT_SUPPORTED, "Unsupported type for Lance version: " + versionType.getDisplayName() +
-                    ". Only integer types (TINYINT, SMALLINT, INTEGER, BIGINT) are supported for FOR VERSION AS OF.");
+                    ". Only integer types (TINYINT, SMALLINT, INTEGER, BIGINT) and VARCHAR ref names are supported for FOR VERSION AS OF.");
         }
 
         if (versionNumber <= 0) {
@@ -290,7 +339,25 @@ public class LanceMetadata
             throw new TrinoException(INVALID_ARGUMENTS, "Lance version does not exist: " + versionNumber);
         }
 
-        return versionNumber;
+        return new LanceRuntime.ResolvedLanceRef(null, versionNumber, null, null);
+    }
+
+    private static void rejectNamedRefWrite(LanceTableHandle table)
+    {
+        if (table.getRefName() != null) {
+            throw new TrinoException(NOT_SUPPORTED, "Writing to Lance ref '" + table.getRefName() + "' is not supported");
+        }
+    }
+
+    private static String refName(Object value)
+    {
+        if (value instanceof Slice slice) {
+            return slice.toStringUtf8();
+        }
+        if (value instanceof String string) {
+            return string;
+        }
+        throw new TrinoException(INVALID_ARGUMENTS, "Lance ref name must be a string");
     }
 
     private Long resolveTemporalVersion(ConnectorSession session, String tablePath,
@@ -351,8 +418,8 @@ public class LanceMetadata
         try {
             Map<String, String> storageOptions = getEffectiveStorageOptions(lanceTableHandle);
             String userIdentity = session.getUser();
-            LanceSchema lanceSchema = runtime.getLanceSchema(userIdentity, lanceTableHandle.getTablePath(), lanceTableHandle.getDatasetVersion(), storageOptions);
-            Schema arrowSchema = runtime.getSchema(userIdentity, lanceTableHandle.getTablePath(), lanceTableHandle.getDatasetVersion(), storageOptions);
+            LanceSchema lanceSchema = runtime.getLanceSchema(userIdentity, lanceTableHandle.getEffectiveReadUri(), lanceTableHandle.getDatasetVersion(), storageOptions);
+            Schema arrowSchema = runtime.getSchema(userIdentity, lanceTableHandle.getEffectiveReadUri(), lanceTableHandle.getDatasetVersion(), storageOptions);
             List<ColumnMetadata> columnsMetadata = LanceRuntime.getColumnMetadata(lanceSchema, arrowSchema);
             SchemaTableName schemaTableName =
                     new SchemaTableName(lanceTableHandle.getSchemaName(), lanceTableHandle.getTableName());
@@ -403,7 +470,7 @@ public class LanceMetadata
         try {
             Map<String, String> storageOptions = getEffectiveStorageOptions(lanceTableHandle);
             String userIdentity = session.getUser();
-            return runtime.getColumnHandles(userIdentity, lanceTableHandle.getTablePath(),
+            return runtime.getColumnHandles(userIdentity, lanceTableHandle.getEffectiveReadUri(),
                     lanceTableHandle.getDatasetVersion(), storageOptions);
         }
         catch (Exception e) {
@@ -606,7 +673,7 @@ public class LanceMetadata
             Map<String, String> storageOptions = getEffectiveStorageOptions(lanceTableHandle);
             String userIdentity = session.getUser();
             ManifestSummary summary = runtime.getManifestSummary(
-                    userIdentity, lanceTableHandle.getTablePath(), lanceTableHandle.getDatasetVersion(), storageOptions);
+                    userIdentity, lanceTableHandle.getEffectiveReadUri(), lanceTableHandle.getDatasetVersion(), storageOptions);
 
             log.debug("getTableStatistics: table=%s, totalRows=%d, totalFilesSize=%d, totalFragments=%d",
                     lanceTableHandle.getTableName(),
@@ -719,7 +786,7 @@ public class LanceMetadata
         Map<String, String> storageOptions = getEffectiveStorageOptions(lanceTableHandle);
         String userIdentity = session.getUser();
         List<LanceColumnHandle> allColumns = runtime.getColumnHandleList(
-                userIdentity, lanceTableHandle.getTablePath(), lanceTableHandle.getDatasetVersion(), storageOptions);
+                userIdentity, lanceTableHandle.getEffectiveReadUri(), lanceTableHandle.getDatasetVersion(), storageOptions);
         List<LanceColumnHandle> physicalColumns = allColumns.stream()
                 .filter(column -> !column.isBlobVirtualColumn())
                 .toList();
@@ -1037,6 +1104,7 @@ public class LanceMetadata
             RetryMode retryMode)
     {
         LanceTableHandle table = (LanceTableHandle) tableHandle;
+        rejectNamedRefWrite(table);
         SchemaTableName tableName = new SchemaTableName(table.getSchemaName(), table.getTableName());
 
         String tablePath = table.getTablePath();
@@ -1141,6 +1209,7 @@ public class LanceMetadata
             RetryMode retryMode)
     {
         LanceTableHandle table = (LanceTableHandle) tableHandle;
+        rejectNamedRefWrite(table);
         SchemaTableName tableName = new SchemaTableName(table.getSchemaName(), table.getTableName());
 
         String tablePath = table.getTablePath();
