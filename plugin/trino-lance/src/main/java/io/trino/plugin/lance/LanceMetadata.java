@@ -256,38 +256,6 @@ public class LanceMetadata
         return new LanceTableHandle(name.getSchemaName(), name.getTableName(), tablePath, tableId, storageOptions, datasetVersion, refName, branchName, readUri);
     }
 
-    @Override
-    public Optional<SystemTable> getSystemTable(ConnectorSession session, SchemaTableName tableName)
-    {
-        Optional<String> baseName = baseTableForRefs(tableName.getTableName());
-        if (baseName.isEmpty()) {
-            return Optional.empty();
-        }
-
-        Optional<ResolvedTable> resolved = resolveTable(new SchemaTableName(tableName.getSchemaName(), baseName.get()));
-        if (resolved.isEmpty()) {
-            return Optional.empty();
-        }
-
-        ResolvedTable table = resolved.get();
-        LanceRefsTable refs = new LanceRefsTable(
-                runtime,
-                tableName,
-                table.description().getLocation(),
-                storageOptionsFrom(table.description()));
-        return Optional.of(new ClassLoaderSafeSystemTable(refs, getClass().getClassLoader()));
-    }
-
-    private static Optional<String> baseTableForRefs(String tableName)
-    {
-        String suffix = "$refs";
-        if (tableName.length() <= suffix.length() ||
-                !tableName.regionMatches(true, tableName.length() - suffix.length(), suffix, 0, suffix.length())) {
-            return Optional.empty();
-        }
-        return Optional.of(tableName.substring(0, tableName.length() - suffix.length()));
-    }
-
     private LanceRuntime.ResolvedLanceRef resolveVersion(ConnectorSession session, String tablePath,
             Map<String, String> storageOptions, ConnectorTableVersion version)
     {
@@ -453,6 +421,11 @@ public class LanceMetadata
         SchemaTableName baseName = new SchemaTableName(tableName.getSchemaName(), tableNameFrom(name));
         return resolveTable(baseName).map(table -> switch (tableType.get()) {
                     case VERSIONS -> new VersionsTable(runtime, tableName, table.tableId);
+                    case REFS -> new LanceRefsTable(
+                            runtime,
+                            tableName,
+                            table.description().getLocation(),
+                            storageOptionsFrom(table.description()));
                 });
     }
 

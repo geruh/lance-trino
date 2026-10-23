@@ -252,19 +252,7 @@ Names are case-sensitive. Branch names select the latest version on that branch 
 
 If a branch and tag share a name, the query fails with an ambiguity error. This also applies to a tag named `main`, which conflicts with the main branch.
 
-To list the available refs, query `"orders$refs"`. The table name requires double quotes because it contains `$`.
-
-```sql
-SELECT name, type, version, branch
-FROM lance.default."orders$refs";
-```
-
-| Column | Description |
-| --- | --- |
-| `name` | Branch or tag name, including `main` |
-| `type` | `BRANCH` or `TAG` |
-| `version` | Latest version for a branch, or the version referenced by a tag |
-| `branch` | Parent branch for branches; owning branch for tags. `NULL` for main and tags on main |
+To list branches and tags, query `"orders$refs"`.
 
 `FOR VERSION AS OF` is supported for reads, but cannot be applied to the target of an `INSERT`, `UPDATE`, or `DELETE`.
 
@@ -349,6 +337,22 @@ SELECT max(version)
 FROM lance.default."orders$versions"
 WHERE timestamp <= TIMESTAMP '2024-06-01 12:00:00 UTC';
 ```
+
+### `$refs` table
+
+The `$refs` table lists branches and tags.
+
+```sql
+SELECT name, type, version, branch
+FROM lance.default."orders$refs";
+```
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `name` | VARCHAR | Branch or tag name, including `main` |
+| `type` | VARCHAR | `BRANCH` or `TAG` |
+| `version` | BIGINT | Latest version for a branch, or the version referenced by a tag |
+| `branch` | VARCHAR | Parent branch for branches, owning branch for tags. `NULL` for main and tags on main |
 
 ## Blob Virtual Columns
 
